@@ -1,0 +1,582 @@
+name: Permanent SSH Node
+
+on:
+  workflow_dispatch:              # 支持手动触发
+  repository_dispatch:            # 支持通过 API 触发
+    types: [restart-permanent-node]
+
+permissions:
+  contents: write
+  actions: write  # 允许触发其他 workflow
+
+# 并发控制：新运行会取消旧运行，实现无缝切换
+concurrency:
+  group: permanent-ssh-node
+  cancel-in-progress: true
+
+jobs:
+  debug:
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Install OpenSSH & bore
+        run: |
+          set -e
+          echo ">>> Install OpenSSH, curl, openssl, python3"
+          if command -v apt-get >/dev/null 2>&1; then
+            sudo apt-get update -y
+            sudo apt-get install -y openssh-server curl openssl python3
+          elif command -v yum >/dev/null 2>&1; then
+            sudo yum install -y openssh-server curl openssl python3
+          else
+            echo "Unsupported package manager, please install openssh-server & curl & openssl & python3 manually."
+            exit 1
+          fi
+
+          echo ">>> Detect arch & download bore"
+          ARCH="$(uname -m)"
+          echo "Detected arch: $ARCH"
+
+          if [ "$ARCH" = "x86_64" ]; then
+            BORE_URL="https://github.com/ekzhang/bore/releases/download/v0.6.0/bore-v0.6.0-x86_64-unknown-linux-musl.tar.gz"
+          else
+            # 其它架构按 ARM 处理（aarch64 musl 版本）
+            BORE_URL="https://github.com/ekzhang/bore/releases/download/v0.6.0/bore-v0.6.0-aarch64-unknown-linux-musl.tar.gz"
+          fi
+
+          echo "Downloading bore from $BORE_URL ..."
+          curl -L "$BORE_URL" -o bore.tar.gz
+
+          echo "Extract bore ..."
+          tar -xzf bore.tar.gz
+
+          if [ -f bore ]; then
+            :
+          else
+            # 从解压目录里找一个 bore 可执行文件
+            BORE_BIN="$(find . -maxdepth 3 -type f -name 'bore' | head -n 1 || true)"
+            if [ -z "$BORE_BIN" ]; then
+              echo "Failed to find bore binary after extract."
+              ls -R .
+              exit 1
+            fi
+            mv "$BORE_BIN" bore
+          fi
+
+          chmod +x bore
+          echo ">>> bore installed:"
+          ./bore --help >/dev/null 2>&1 || true
+
+      - name: Configure SSH, start bore tunnels and save endpoints
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          NODE_TTL_MINUTES: "300"
+          NODE_WEB_PORTS: "2000 3000 4000 5000"
+        run: |
+          set -euo pipefail
+
+          TTL_MIN=${NODE_TTL_MINUTES:-60}
+          TTL_SEC=$(( TTL_MIN * 60 ))
+          PORT_LIST_STR="${NODE_WEB_PORTS:-}"
+
+          echo ">>> TTL (minutes): $TTL_MIN"
+          echo ">>> Extra TCP ports to expose via bore: ${PORT_LIST_STR:-<none>}"
+
+          # ===== 创建本地 data 目录 =====
+          echo ">>> Creating local /data directory (no WebDAV mount)"
+          sudo mkdir -p /data
+          sudo chown root:root /data
+          echo ">>> Created local /data directory (data will not persist)"
+
+          # 创建或更新 reboot.txt（只在文件不存在时创建模板）
+          REBOOT_FILE="reboot.txt"
+          if [ ! -f "$REBOOT_FILE" ]; then
+            echo ">>> Creating reboot.txt template (first run or file doesn't exist)..."
+            echo "# 开机时可以在这里添加自定义启动命令" > "$REBOOT_FILE"
+            echo "# 例如：从备份恢复数据等" >> "$REBOOT_FILE"
+            echo "" >> "$REBOOT_FILE"
+            echo ">>> reboot.txt template created"
+          else
+            echo ">>> reboot.txt already exists, keeping existing content"
+          fi
+          
+          # 创建或更新 shut.txt（只在文件不存在时创建模板）
+          SHUTDOWN_FILE="shut.txt"
+          if [ ! -f "$SHUTDOWN_FILE" ]; then
+            echo ">>> Creating shut.txt template (first run or file doesn't exist)..."
+            echo "# 关机前可以在这里添加自定义关机命令" > "$SHUTDOWN_FILE"
+            echo "# 例如：清理临时文件、保存配置等" >> "$SHUTDOWN_FILE"
+            echo "" >> "$SHUTDOWN_FILE"
+            echo ">>> shut.txt template created"
+          else
+            echo ">>> shut.txt already exists, keeping existing content"
+          fi
+
+          # 自动下载并恢复最新备份（如果backup.txt存在）
+          if [ -f "backup.txt" ] && [ -s "backup.txt" ]; then
+            echo ">>> Found backup.txt, downloading latest backup..."
+            
+            # 获取最后一行备份信息
+            LAST_LINE=$(tail -n 1 "backup.txt")
+            LAST_FILENAME=$(echo "$LAST_LINE" | awk '{print $1}')
+            
+            # 检查是否是分片备份（文件名包含.part数字.tar.gz）
+            if [[ "$LAST_FILENAME" =~ \.part[0-9]+\.tar\.gz$ ]]; then
+              # 这是分片备份，提取基础文件名和时间戳
+              BASE_NAME=$(echo "$LAST_FILENAME" | sed 's/\.part[0-9]*\.tar\.gz$//')
+              echo ">>> Found split backup: $BASE_NAME"
+              
+              # 从backup.txt中找到所有相同基础名的分片
+              # 在临时目录操作，避免权限问题
+              cd /tmp
+              DOWNLOAD_SUCCESS=true
+              
+              # 创建临时文件存储分片信息
+              TEMP_PARTS="/tmp/backup_parts.txt"
+              > "$TEMP_PARTS"
+              
+              # 倒序读取backup.txt，找到所有相同基础名的分片
+              tac "$GITHUB_WORKSPACE/backup.txt" | while read -r line; do
+                if [ -z "$line" ] || [[ "$line" =~ ^# ]]; then
+                  continue
+                fi
+                
+                FILENAME=$(echo "$line" | awk '{print $1}')
+                FILE_URL=$(echo "$line" | awk '{print $2}')
+                
+                # 检查是否属于同一个备份的分片
+                if [[ "$FILENAME" =~ ^${BASE_NAME}\.part[0-9]+\.tar\.gz$ ]]; then
+                  echo "$FILENAME $FILE_URL" >> "$TEMP_PARTS"
+                else
+                  # 遇到不同备份的文件，停止
+                  break
+                fi
+              done
+              
+              # 读取分片信息并下载
+              PART_COUNT=0
+              if [ -s "$TEMP_PARTS" ]; then
+                while read -r FILENAME FILE_URL; do
+                  PART_NUM=$(echo "$FILENAME" | grep -o 'part[0-9]*' | sed 's/part//')
+                  echo ">>> Downloading part $PART_NUM: $FILENAME"
+                  
+                  if curl -L -o "$FILENAME" "$FILE_URL"; then
+                    echo ">>> Part $PART_NUM downloaded successfully"
+                    PART_COUNT=$((PART_COUNT + 1))
+                  else
+                    echo "!!! Failed to download part $PART_NUM"
+                    DOWNLOAD_SUCCESS=false
+                    break
+                  fi
+                done < "$TEMP_PARTS"
+              fi
+              
+              rm -f "$TEMP_PARTS"
+              
+              if [ "$DOWNLOAD_SUCCESS" = true ] && [ "$PART_COUNT" -gt 0 ]; then
+                echo ">>> All $PART_COUNT parts downloaded, reassembling..."
+                BACKUP_FILE="${BASE_NAME}.tar.gz"
+                
+                # 重新组装文件（按part1, part2, part3...顺序）
+                > "$BACKUP_FILE"  # 创建空文件
+                for i in $(seq 1 "$PART_COUNT"); do
+                  PART_FILE="${BASE_NAME}.part${i}.tar.gz"
+                  if [ -f "$PART_FILE" ]; then
+                    cat "$PART_FILE" >> "$BACKUP_FILE"
+                    rm -f "$PART_FILE"
+                  else
+                    echo "!!! Part file $PART_FILE not found"
+                    DOWNLOAD_SUCCESS=false
+                    break
+                  fi
+                done
+                
+                if [ "$DOWNLOAD_SUCCESS" = true ]; then
+                  # 解压备份文件到 /data
+                  if tar -xzf "$BACKUP_FILE" -C /data; then
+                    echo ">>> Split backup restored successfully to /data"
+                    sudo chown -R root:root /data || true
+                  else
+                    echo "!!! Failed to extract reassembled backup file"
+                  fi
+                  
+                  rm -f "$BACKUP_FILE"
+                else
+                  echo "!!! Failed to reassemble split backup"
+                fi
+              else
+                echo "!!! Failed to download all parts of split backup"
+              fi
+              
+              # 切换回仓库目录
+              cd "$GITHUB_WORKSPACE"
+              
+            else
+              # 这是单文件备份
+              BACKUP_FILENAME=$(echo "$LAST_LINE" | awk '{print $1}')
+              BACKUP_URL=$(echo "$LAST_LINE" | awk '{print $2}')
+              
+              if [ -n "$BACKUP_URL" ] && [ -n "$BACKUP_FILENAME" ]; then
+                echo ">>> Downloading single backup: $BACKUP_FILENAME from $BACKUP_URL"
+                # 在临时目录下载，避免权限问题
+                cd /tmp
+                
+                # 下载备份文件
+                if curl -L -o "$BACKUP_FILENAME" "$BACKUP_URL"; then
+                  echo ">>> Download successful, extracting to /data..."
+                  
+                  # 解压备份文件到 /data
+                  if tar -xzf "$BACKUP_FILENAME" -C /data; then
+                    echo ">>> Backup restored successfully to /data"
+                    # 设置正确的权限
+                    sudo chown -R root:root /data || true
+                  else
+                    echo "!!! Failed to extract backup file"
+                  fi
+                  
+                  # 清理下载的备份文件
+                  rm -f "$BACKUP_FILENAME"
+                else
+                  echo "!!! Failed to download backup from $BACKUP_URL"
+                fi
+              else
+                echo "!!! Invalid backup entry format in backup.txt"
+              fi
+              
+              # 切换回仓库目录
+              cd "$GITHUB_WORKSPACE"
+            fi
+          else
+            echo ">>> No backup.txt found or file is empty, skipping backup restore (first run?)"
+          fi
+
+          # 执行重启命令文件（如果存在）
+          REBOOT_FILE="reboot.txt"
+          
+          if [ -f "$REBOOT_FILE" ]; then
+            echo ">>> Found $REBOOT_FILE, executing commands..."
+            echo ">>> Working directory: /root"
+            
+            # 使用 sudo 切换到 /root 目录执行命令
+            sudo bash -c "cd /root && while IFS= read -r cmd || [ -n \"\$cmd\" ]; do
+              # 跳过空行和注释行
+              if [ -z \"\$cmd\" ] || [[ \"\$cmd\" =~ ^[[:space:]]*# ]]; then
+                continue
+              fi
+              
+              echo \">>> Executing: \$cmd\"
+              eval \"\$cmd\" || echo \"!!! Command failed: \$cmd\"
+            done < \"$GITHUB_WORKSPACE/$REBOOT_FILE\""
+            
+            echo ">>> Finished executing $REBOOT_FILE commands"
+          else
+            echo ">>> No $REBOOT_FILE found, skipping custom commands"
+          fi
+
+          echo ">>> Configure & start OpenSSH server"
+          sudo mkdir -p /var/run/sshd
+
+          # 检查是否有保存的密码（从 ssh.txt 读取）
+          SAVED_PASSWORD=""
+          if [ -f ssh.txt ]; then
+            SAVED_PASSWORD=$(grep -oP '(?<=password: ).+' ssh.txt 2>/dev/null || true)
+            if [ -n "$SAVED_PASSWORD" ]; then
+              echo ">>> Found saved password from ssh.txt, reusing it"
+              ROOT_PASS="$SAVED_PASSWORD"
+            fi
+          fi
+          
+          # 如果没有保存的密码，生成新密码
+          if [ -z "${ROOT_PASS:-}" ]; then
+            ROOT_PASS="$(openssl rand -base64 18 | tr -d '=+/' | head -c 16)"
+            echo ">>> Generated new root password (first run)"
+          fi
+
+          # 设置 root 密码
+          echo "root:${ROOT_PASS}" | sudo chpasswd
+
+          # 恢复 SSH host keys（如果存在）
+          if [ -d key ]; then
+            echo ">>> Found saved SSH host keys, restoring..."
+            sudo cp -f key/* /etc/ssh/
+            sudo chmod 600 /etc/ssh/ssh_host_*_key
+            sudo chmod 644 /etc/ssh/ssh_host_*_key.pub
+            echo ">>> SSH host keys restored"
+          else
+            echo ">>> No saved SSH host keys found, will generate new ones"
+          fi
+
+          # 调整 sshd 配置：允许 root & 密码登录
+          sudo sed -i 's/^#\?PermitRootLogin .*/PermitRootLogin yes/' /etc/ssh/sshd_config || true
+          sudo sed -i 's/^#\?PasswordAuthentication .*/PasswordAuthentication yes/' /etc/ssh/sshd_config || true
+          sudo sed -i 's/^#\?KbdInteractiveAuthentication .*/KbdInteractiveAuthentication no/' /etc/ssh/sshd_config || true
+
+          # 启动 sshd（会自动生成缺失的 host keys）
+          sudo /usr/sbin/sshd -D -e &
+          SSHD_PID=$!
+          echo ">>> sshd started with PID $SSHD_PID"
+          
+          # 等待 sshd 生成 host keys
+          sleep 2
+          
+          # 备份 SSH host keys 到仓库（首次运行或 keys 更新时）
+          if [ ! -d key ]; then
+            echo ">>> Backing up SSH host keys..."
+            mkdir -p key
+            sudo cp /etc/ssh/ssh_host_*_key /etc/ssh/ssh_host_*_key.pub key/
+            sudo chmod 644 key/*
+            echo ">>> SSH host keys backed up to key/"
+          fi
+
+          rm -f bore_*.log bore_ssh.log
+
+          echo ">>> Start bore tunnel for SSH (local port 22)"
+          
+          # 检查是否有保存的 SSH 端口（从 ssh.txt 解析）
+          SAVED_SSH_PORT=""
+          if [ -f ssh.txt ]; then
+            SAVED_SSH_PORT=$(grep -oP '(?<=-p )\d+' ssh.txt 2>/dev/null || true)
+            if [ -n "$SAVED_SSH_PORT" ]; then
+              echo ">>> Found saved SSH port from ssh.txt: $SAVED_SSH_PORT"
+            fi
+          fi
+          
+          # 启动 bore tunnel
+          if [ -n "$SAVED_SSH_PORT" ]; then
+            echo ">>> Using saved remote port: $SAVED_SSH_PORT"
+            nohup ./bore local 22 --to bore.pub --port "$SAVED_SSH_PORT" > bore_ssh.log 2>&1 &
+          else
+            echo ">>> Using random remote port (first run)"
+            nohup ./bore local 22 --to bore.pub > bore_ssh.log 2>&1 &
+          fi
+
+          # 额外 TCP 端口（可为空：不填就是只开 SSH，不建任何端口映射）
+          read -ra PORTS <<< "$PORT_LIST_STR"
+          if [ "${#PORTS[@]}" -gt 0 ]; then
+            echo ">>> Start bore tunnels for extra TCP ports ..."
+            for p in "${PORTS[@]}"; do
+              p_trim="$(echo "$p" | xargs || true)"
+              if [ -z "$p_trim" ]; then
+                continue
+              fi
+              log_file="bore_${p_trim}.log"
+              echo "  - launching bore tunnel for local port $p_trim ..."
+              nohup ./bore local "$p_trim" --to bore.pub > "$log_file" 2>&1 &
+            done
+          fi
+
+          echo ">>> Waiting for bore to establish tunnels ..."
+          sleep 10
+
+          SSH_HOST="nat.mugassn.dpdns.org"
+
+          # 解析 SSH 远程端口
+          SSH_REMOTE_PORT="$(grep -Eo 'bore\.pub:[0-9]+' bore_ssh.log | head -n 1 | sed 's/.*://')"
+          if [ -z "${SSH_REMOTE_PORT:-}" ]; then
+            echo "!!! 未能从 bore_ssh.log 中解析 SSH 远端端口"
+          else
+            SSH_CMD="ssh root@${SSH_HOST} -p ${SSH_REMOTE_PORT}"
+            echo ">>> SSH command: ${SSH_CMD}"
+
+            {
+              echo "${SSH_CMD}"
+              echo "password: ${ROOT_PASS}"
+            } > ssh.txt
+          fi
+
+          # 解析额外 TCP 端口并写入 web.txt
+          > web.txt
+          if [ "${#PORTS[@]}" -gt 0 ]; then
+            echo ">>> Parsing bore remote endpoints for extra ports ..."
+            for p in "${PORTS[@]}"; do
+              p_trim="$(echo "$p" | xargs || true)"
+              if [ -z "$p_trim" ]; then
+                continue
+              fi
+              log_file="bore_${p_trim}.log"
+              if [ -f "$log_file" ]; then
+                REMOTE_PORT="$(grep -Eo 'bore\.pub:[0-9]+' "$log_file" | head -n 1 | sed 's/.*://')"
+                if [ -n "${REMOTE_PORT:-}" ]; then
+                  PUBLIC="${SSH_HOST}:${REMOTE_PORT}"
+                  echo ">>> Bore tunnel for local port ${p_trim}: ${PUBLIC}"
+                  echo "${p_trim} ${PUBLIC}" >> web.txt
+                else
+                  echo "!!! 未能从 bore 日志中解析远端端口 (local=${p_trim})"
+                fi
+              else
+                echo "!!! bore 日志文件不存在: ${log_file}"
+              fi
+            done
+          fi
+
+          echo ">>> Configure git & push ssh.txt / web.txt / key/ ..."
+          git config user.name "permanent-node-automation"
+          git config user.email "permanent-node-automation@noreply.local"
+
+          git add ssh.txt web.txt key/ || true
+          # 添加 reboot.txt 和 shut.txt 到版本控制
+          [ -f reboot.txt ] && git add reboot.txt || echo "reboot.txt not found"
+          [ -f shut.txt ] && git add shut.txt || echo "shut.txt not found"
+          [ -f backup.txt ] && git add backup.txt || echo "backup.txt not found (normal for first run)"
+          TS="$(date -u +%Y%m%dT%H%M%SZ)"
+          git commit -m "chore: update permanent node endpoints $TS" || echo "Nothing to commit"
+
+          REMOTE_URL="https://x-access-token:${GITHUB_TOKEN}@github.com/${GITHUB_REPOSITORY}.git"
+          git push "$REMOTE_URL" HEAD:${GITHUB_REF_NAME} || echo "git push failed (non-fatal)"
+
+          echo ">>> Permanent node ready! Local storage at /data"
+          echo ">>> Running for ${TTL_MIN} minutes..."
+          
+          # 等待到 TTL 结束
+          sleep "$TTL_SEC" || true
+          
+          echo ">>> TTL reached, executing shutdown commands if any..."
+          
+          # 执行关机前命令（如果存在）
+          SHUTDOWN_FILE="shut.txt"
+          if [ -f "$SHUTDOWN_FILE" ]; then
+            echo ">>> Found $SHUTDOWN_FILE, executing shutdown commands..."
+            echo ">>> Working directory: /root"
+            
+            # 记录备份开始时间
+            BACKUP_START=$(date +%s)
+            echo ">>> Backup started at: $(date)"
+            
+            # 使用 sudo 切换到 /root 目录执行命令
+            sudo bash -c "cd /root && while IFS= read -r cmd || [ -n \"\$cmd\" ]; do
+              # 跳过空行和注释行
+              if [ -z \"\$cmd\" ] || [[ \"\$cmd\" =~ ^[[:space:]]*# ]]; then
+                continue
+              fi
+              
+              echo \">>> Executing: \$cmd\"
+              eval \"\$cmd\" || echo \"!!! Command failed: \$cmd\"
+            done < \"$GITHUB_WORKSPACE/$SHUTDOWN_FILE\""
+            
+            # 计算备份用时
+            BACKUP_END=$(date +%s)
+            BACKUP_DURATION=$((BACKUP_END - BACKUP_START))
+            echo ">>> Custom shutdown commands completed in ${BACKUP_DURATION} seconds"
+            
+            # 直接在工作流中执行备份上传
+            echo ">>> Starting /data backup and upload..."
+            if [ -d /data ] && [ "$(ls -A /data 2>/dev/null)" ]; then
+              # 在临时目录创建备份，避免权限问题
+              BACKUP_TIME=$(TZ='Asia/Shanghai' date +'%Y%m%d_%H%M%S')
+              BACKUP_FILE="/tmp/data_backup_${BACKUP_TIME}.tar.gz"
+              echo ">>> Creating backup: $BACKUP_FILE"
+              tar -czf "$BACKUP_FILE" --exclude="$BACKUP_FILE" -C /data .
+              
+              # 检查文件大小
+              BACKUP_SIZE=$(stat -c%s "$BACKUP_FILE" 2>/dev/null || echo "0")
+              BACKUP_SIZE_MB=$((BACKUP_SIZE / 1024 / 1024))
+              echo ">>> Backup size: ${BACKUP_SIZE_MB}MB"
+              
+              if [ "$BACKUP_SIZE_MB" -gt 1000 ]; then
+                echo ">>> Backup is larger than 1000MB, splitting into 1000MB chunks..."
+                # 切换到临时目录进行分片操作
+                cd /tmp
+                # 分割文件为1000MB的块
+                split -b 1000M "$BACKUP_FILE" "${BACKUP_FILE}.part"
+                rm -f "$BACKUP_FILE"  # 删除原始大文件
+                
+                # 重命名分片文件为part1, part2格式
+                PART_NUM=1
+                for part_file in "${BACKUP_FILE}".part*; do
+                  if [ -f "$part_file" ]; then
+                    NEW_NAME="data_backup_${BACKUP_TIME}.part${PART_NUM}.tar.gz"
+                    mv "$part_file" "$NEW_NAME"
+                    PART_NUM=$((PART_NUM + 1))
+                  fi
+                done
+                
+                # 上传所有分片
+                UPLOAD_SUCCESS=true
+                PART_COUNT=0
+                for part_file in data_backup_${BACKUP_TIME}.part*.tar.gz; do
+                  if [ -f "$part_file" ]; then
+                    PART_COUNT=$((PART_COUNT + 1))
+                    echo ">>> Uploading part ${PART_COUNT}: $(basename "$part_file")"
+                    UPLOAD_RESULT=$(curl -s -F "files[]=@$part_file" https://pomf.lain.la/upload.php)
+                    echo ">>> Upload result: $UPLOAD_RESULT"
+                    DOWNLOAD_URL=$(echo "$UPLOAD_RESULT" | python3 -c "import sys, json; data=json.load(sys.stdin); print(data['files'][0]['url'] if 'files' in data and len(data['files']) > 0 else '')" 2>/dev/null || echo "")
+                    
+                    if [ -n "$DOWNLOAD_URL" ]; then
+                      echo ">>> Part ${PART_COUNT} upload successful: $DOWNLOAD_URL"
+                      echo "$(basename "$part_file") $DOWNLOAD_URL" >> "$GITHUB_WORKSPACE/backup.txt"
+                    else
+                      echo "!!! Part ${PART_COUNT} upload failed"
+                      UPLOAD_SUCCESS=false
+                    fi
+                    rm -f "$part_file"
+                  fi
+                done
+                
+                if [ "$UPLOAD_SUCCESS" = true ]; then
+                  echo ">>> All ${PART_COUNT} parts uploaded successfully"
+                else
+                  echo "!!! Some parts failed to upload"
+                fi
+              else
+                echo ">>> Backup size is acceptable, uploading as single file..."
+                echo ">>> Uploading to pomf..."
+                cd /tmp
+                UPLOAD_RESULT=$(curl -s -F "files[]=@$BACKUP_FILE" https://pomf.lain.la/upload.php)
+                echo ">>> Upload result: $UPLOAD_RESULT"
+                DOWNLOAD_URL=$(echo "$UPLOAD_RESULT" | python3 -c "import sys, json; data=json.load(sys.stdin); print(data['files'][0]['url'] if 'files' in data and len(data['files']) > 0 else '')" 2>/dev/null || echo "")
+                if [ -n "$DOWNLOAD_URL" ]; then
+                  echo ">>> Upload successful: $DOWNLOAD_URL"
+                  echo "$(basename "$BACKUP_FILE") $DOWNLOAD_URL" >> "$GITHUB_WORKSPACE/backup.txt"
+                else
+                  echo "!!! Upload failed or could not parse response"
+                fi
+                rm -f "$BACKUP_FILE"
+              fi
+            else
+              echo ">>> No /data directory found or empty, skipping backup"
+            fi
+            
+            # 提交 backup.txt 到仓库
+            cd "$GITHUB_WORKSPACE"
+            if [ -f backup.txt ]; then
+              echo ">>> Committing backup.txt to repository..."
+              git add backup.txt || true
+              # 确保其他重要文件也被添加
+              git add ssh.txt web.txt key/ reboot.txt shut.txt || true
+              BACKUP_TS="$(date -u +%Y%m%dT%H%M%SZ)"
+              git commit -m "chore: update backup links and node info $BACKUP_TS" || true
+              REMOTE_URL="https://x-access-token:${GITHUB_TOKEN}@github.com/${GITHUB_REPOSITORY}.git"
+              git push "$REMOTE_URL" HEAD:${GITHUB_REF_NAME} || true
+              echo ">>> backup.txt and other files committed successfully"
+            fi
+            
+            # 等待备份完全完成
+            echo ">>> Waiting for backup sync to complete..."
+            sleep 30
+            
+            echo ">>> Finished executing $SHUTDOWN_FILE commands"
+          else
+            echo ">>> No $SHUTDOWN_FILE found, skipping shutdown commands"
+          fi
+          
+          echo ">>> Triggering next run to replace this one..."
+          
+          # 触发新运行（会自动取消当前运行）
+          curl -s -X POST \
+            -H "Authorization: Bearer ${GITHUB_TOKEN}" \
+            -H "Accept: application/vnd.github+json" \
+            -H "Content-Type: application/json" \
+            "https://api.github.com/repos/${GITHUB_REPOSITORY}/dispatches" \
+            -d '{"event_type":"restart-permanent-node"}' || echo "Trigger failed, cron will handle restart"
+          
+          echo ">>> New run triggered, current run will be cancelled automatically"
+          echo ">>> Waiting for cancellation..."
+          
+          # 给下一轮启动缓冲时间，避免重叠
+          sleep 180  # 3分钟缓冲时间
