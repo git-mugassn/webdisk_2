@@ -1,4 +1,4 @@
-2000 nat.mugassn.dpdns.org:8382
-3000 nat.mugassn.dpdns.org:1361
-4000 nat.mugassn.dpdns.org:38071
-5000 nat.mugassn.dpdns.org:4935
+2000 nat.mugassn.dpdns.org:55650
+3000 nat.mugassn.dpdns.org:63647
+4000 nat.mugassn.dpdns.org:21709
+5000 nat.mugassn.dpdns.org:14331
